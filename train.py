@@ -548,19 +548,6 @@ class Model(eqx.Module):
 
 class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
 
-    def __init__(self, config: HumanoidWalkingTaskConfig) -> None:
-        super().__init__(config)
-        animation = MjAnim.load(config.reference_motion_path)
-        qpos_sequence = animation.to_numpy(config.ctrl_dt, interp="cubic", loop=True)
-        qvel_sequence = jnp.diff(qpos_sequence, axis=0) / config.ctrl_dt
-        self.reference_motion = ksim.MotionReferenceData(
-            qpos=xax.HashableArray(qpos_sequence),
-            qvel=xax.HashableArray(qvel_sequence),
-            cartesian_poses=xax.FrozenDict({}),
-            ctrl_dt=config.ctrl_dt,
-        )
-
-
     def get_optimizer(self) -> optax.GradientTransformation:
         return (
             optax.adam(self.config.learning_rate)
@@ -932,13 +919,23 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         action_j = action_dist_j.mode() if argmax else action_dist_j.sample(seed=rng)
         return ksim.Action(action=action_j, carry=(actor_carry, critic_carry_in))
 
-
     def run(self) -> None:
-        if self.config.run_mode.lower() == "run_motion"
+
+        animation = MjAnim.load(self.config.reference_motion_path)
+        qpos_sequence = animation.to_numpy(self.config.ctrl_dt, interp="cubic", loop=True)
+        qvel_sequence = jnp.diff(qpos_sequence, axis=0) / self.config.ctrl_dt
+        self.reference_motion = ksim.MotionReferenceData(
+            qpos=xax.HashableArray(qpos_sequence),
+            qvel=xax.HashableArray(qvel_sequence),
+            cartesian_poses=xax.FrozenDict({}),
+            ctrl_dt=self.config.ctrl_dt,
+        )
+
+        if self.config.run_mode.lower() == "view_motion":
             ksim.visualize_reference_motion(
                 model=self.get_mujoco_model(),
-                reference_qpos=np.asarray(self.reference_motion.qpos),
-                cartesian_motion=np.asarray(self.reference_motion.cartesian_poses),
+                reference_qpos=np.asarray(self.reference_motion.qpos.array),
+                cartesian_motion=self.reference_motion.cartesian_poses,
                 mj_base_id=0,
             )
         else:
