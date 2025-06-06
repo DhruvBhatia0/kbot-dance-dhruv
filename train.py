@@ -54,7 +54,7 @@ class HumanoidWalkingTaskConfig(ksim.PPOConfig):
 
     # Task parameters.
     reference_motion_path: Path = xax.field(
-        value=Path(__file__).parent/ "assets" / "shikanoko.mjanim",
+        value=Path(__file__).parent / "assets" / "shikanoko.mjanim",
         help="The path to the reference motion to use for the task.",
     )
 
@@ -105,7 +105,7 @@ class HumanoidWalkingTaskConfig(ksim.PPOConfig):
         value=0.01,
         help="The minimum curriculum level.",
     )
-    
+
     # Reward Weights
     action_acc: float = xax.field(
         value=0.02,
@@ -115,7 +115,7 @@ class HumanoidWalkingTaskConfig(ksim.PPOConfig):
         value=0.02,
         help="The weight for the action velocity penalty.",
     )
-    
+
     # Optimizer parameters.
     learning_rate: float = xax.field(
         value=3e-4,
@@ -289,6 +289,7 @@ class AnkleKneePenalty(JointPositionPenalty):
             scale_by_curriculum=scale_by_curriculum,
         )
 
+
 @attrs.define(frozen=True, kw_only=True)
 class FrameTimestepObservation(ksim.TimestepObservation):
     """Observation of the phase of the timestep (matches gait phase calculation in FeetPhaseReward)."""
@@ -300,12 +301,14 @@ class FrameTimestepObservation(ksim.TimestepObservation):
 
         return jnp.mod(timestep, self.motion_reference.num_frames * self.motion_reference.ctrl_dt)
 
+
 @attrs.define(frozen=True, kw_only=True)
 class FeetContactObservation(ksim.FeetContactObservation):
     """Flattened (4,) contact flags of both feet."""
 
     def observe(self, state: ksim.ObservationInput, curriculum_level: Array, rng: PRNGKeyArray) -> Array:
         return super().observe(state, curriculum_level, rng).flatten()
+
 
 @attrs.define(frozen=True, kw_only=True)
 class ActionVelocityPenalty(ksim.Reward):
@@ -320,6 +323,7 @@ class ActionVelocityPenalty(ksim.Reward):
         actions_vel = jnp.where(done, 0.0, actions_zp[..., 1:, :] - actions_zp[..., :-1, :])
         penalty = xax.get_norm(actions_vel, self.norm).mean(axis=-1)
         return penalty
+
 
 @attrs.define(frozen=True)
 class FeetPositionObservation(ksim.Observation):
@@ -349,6 +353,7 @@ class FeetPositionObservation(ksim.Observation):
         )
         return jnp.concatenate([fl, fr], axis=-1)
 
+
 @attrs.define(frozen=True, kw_only=True)
 class QposReferenceMotionReward(ksim.Reward):
     """Reward for matching the reference motion."""
@@ -360,6 +365,7 @@ class QposReferenceMotionReward(ksim.Reward):
         qpos_ref = self.reference_motion.get_qpos_at_time(trajectory.timestep)
         qpos = trajectory.qpos
         return xax.get_norm(qpos - qpos_ref, "l2").mean(axis=-1)
+
 
 class Actor(eqx.Module):
     """Actor for the walking task."""
@@ -547,7 +553,6 @@ class Model(eqx.Module):
 
 
 class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
-
     def get_optimizer(self) -> optax.GradientTransformation:
         return (
             optax.adam(self.config.learning_rate)
@@ -920,7 +925,6 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         return ksim.Action(action=action_j, carry=(actor_carry, critic_carry_in))
 
     def run(self) -> None:
-
         animation = MjAnim.load(self.config.reference_motion_path)
         qpos_sequence = animation.to_numpy(self.config.ctrl_dt, interp="cubic", loop=True)
         qvel_sequence = jnp.diff(qpos_sequence, axis=0) / self.config.ctrl_dt
@@ -935,7 +939,9 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             ksim.visualize_reference_motion(
                 model=self.get_mujoco_model(),
                 reference_qpos=np.asarray(self.reference_motion.qpos.array),
-                cartesian_motion=self.reference_motion.cartesian_poses,
+                cartesian_motion=xax.FrozenDict({
+                    body_id: np.asarray(poses.array) for body_id, poses in self.reference_motion.cartesian_poses.items()
+                }),
                 mj_base_id=0,
             )
         else:
