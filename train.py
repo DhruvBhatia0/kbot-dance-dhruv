@@ -355,16 +355,46 @@ class FeetPositionObservation(ksim.Observation):
 
 
 @attrs.define(frozen=True, kw_only=True)
+class StartDanceCommand(ksim.Command):
+    """Binary signal to dance or not."""
+
+    switch_prob: float = 0.5
+    still_prob: float = 0.5
+
+    def initial_command(
+        self,
+        physics_data: ksim.PhysicsData,
+        curriculum_level: Array,
+        rng: PRNGKeyArray,
+    ) -> Array:
+        return jnp.array([jax.random.bernoulli(rng, self.still_prob)])
+
+    def __call__(
+        self,
+        prev_command: Array,
+        physics_data: ksim.PhysicsData,
+        curriculum_level: Array,
+        rng: PRNGKeyArray,
+    ) -> Array:
+        rng_a, rng_b = jax.random.split(rng)
+        switch_mask = jax.random.bernoulli(rng_a, self.switch_prob)
+        new_command = self.initial_command(physics_data, curriculum_level, rng_b)
+        return jnp.where(switch_mask, new_command, prev_command)
+
+
+@attrs.define(frozen=True, kw_only=True)
 class QposReferenceMotionReward(ksim.Reward):
     """Reward for matching the reference motion."""
 
     scale: float = 1.0
     reference_motion: ksim.MotionReferenceData
+    command_name: str = "start_dance_command"
 
     def get_reward(self, trajectory: ksim.Trajectory) -> Array:
+        command = trajectory.command[self.command_name]
         qpos_ref = self.reference_motion.get_qpos_at_time(trajectory.timestep)
         qpos = trajectory.qpos
-        return xax.get_norm(qpos - qpos_ref, "l2").mean(axis=-1)
+        return jnp.where(command[..., 0] > 0.0, xax.get_norm(qpos - qpos_ref, "l2").mean(axis=-1), jnp.array(0.0))
 
 
 class Actor(eqx.Module):
@@ -565,7 +595,6 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         model = mujoco_scenes.mjcf.load_mjmodel(mjcf_path, scene="smooth")
         names_to_idxs = ksim.get_geom_data_idx_by_name(model)
         model.geom_priority[names_to_idxs["floor"]] = 2.0
-        model.opt.gravity[2] = -1.0
         return model
 
     def get_mujoco_model_metadata(self, mj_model: mujoco.MjModel) -> ksim.Metadata:
@@ -591,32 +620,32 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
 
     def get_physics_randomizers(self, physics_model: ksim.PhysicsModel) -> list[ksim.PhysicsRandomizer]:
         return [
-            ksim.StaticFrictionRandomizer(),
-            ksim.ArmatureRandomizer(scale_lower=0.1, scale_upper=10.0),
-            ksim.AllBodiesMassMultiplicationRandomizer(scale_lower=0.85, scale_upper=1.15),
-            ksim.JointDampingRandomizer(scale_lower=0.1, scale_upper=10.0),
-            ksim.JointZeroPositionRandomizer(scale_lower=math.radians(-4), scale_upper=math.radians(4)),
-            ksim.FloorFrictionRandomizer.from_geom_name(
-                model=physics_model, floor_geom_name="floor", scale_lower=0.3, scale_upper=1.5
-            ),
+            # ksim.StaticFrictionRandomizer(),
+            # ksim.ArmatureRandomizer(scale_lower=0.1, scale_upper=10.0),
+            # ksim.AllBodiesMassMultiplicationRandomizer(scale_lower=0.85, scale_upper=1.15),
+            # ksim.JointDampingRandomizer(scale_lower=0.1, scale_upper=10.0),
+            # ksim.JointZeroPositionRandomizer(scale_lower=math.radians(-4), scale_upper=math.radians(4)),
+            # ksim.FloorFrictionRandomizer.from_geom_name(
+            #     model=physics_model, floor_geom_name="floor", scale_lower=0.3, scale_upper=1.5
+            # ),
         ]
 
     def get_events(self, physics_model: ksim.PhysicsModel) -> list[ksim.Event]:
         return [
-            ksim.PushEvent(
-                x_linvel=0.7,
-                y_linvel=0.7,
-                z_linvel=0.7,
-                vel_range=(0.5, 2.0),
-                x_angvel=0.7,
-                y_angvel=0.7,
-                z_angvel=0.7,
-                interval_range=(2.0, 4.0),
-            ),
-            ksim.JumpEvent(
-                jump_height_range=(0.0, 0.3),
-                interval_range=(3.0, 15.0),
-            ),
+            # ksim.PushEvent(
+            #     x_linvel=0.7,
+            #     y_linvel=0.7,
+            #     z_linvel=0.7,
+            #     vel_range=(0.5, 2.0),
+            #     x_angvel=0.7,
+            #     y_angvel=0.7,
+            #     z_angvel=0.7,
+            #     interval_range=(2.0, 4.0),
+            # ),
+            # ksim.JumpEvent(
+            #     jump_height_range=(0.0, 0.3),
+            #     interval_range=(3.0, 15.0),
+            # ),
         ]
 
     def get_resets(self, physics_model: ksim.PhysicsModel) -> list[ksim.Reset]:
@@ -682,12 +711,14 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         ]
 
     def get_commands(self, physics_model: ksim.PhysicsModel) -> list[ksim.Command]:
-        return []
+        return [
+            StartDanceCommand(still_prob=0.1, switch_prob=0.1),
+        ]
 
     def get_rewards(self, physics_model: ksim.PhysicsModel) -> list[ksim.Reward]:
         return [
             # Standard rewards.
-            ksim.StayAliveReward(scale=50.0),
+            ksim.StayAliveReward(scale=5.0),
             QposReferenceMotionReward(scale=1.0, reference_motion=self.reference_motion),
             # Normalisation penalties.
             # ksim.AvoidLimitsPenalty.create(physics_model, scale=-0.01, scale_by_curriculum=True),
@@ -731,10 +762,12 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         # timestep + joint pos / vel + proj_grav
         num_actor_obs = 1 + num_joints * 2 + 3
 
+        num_commands = 1
+
         if self.config.use_gyro:
             num_actor_obs += 3
 
-        num_actor_inputs = num_actor_obs
+        num_actor_inputs = num_actor_obs + num_commands
 
         num_critic_inputs = (
             num_actor_inputs
@@ -778,8 +811,10 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         joint_vel_n = observations["joint_velocity_observation"]
         proj_grav_3 = observations["projected_gravity_observation"]
         imu_gyro_3 = observations["sensor_observation_imu_gyro"]
+        dance_command_1 = observations["start_dance_command"]
 
         obs = [
+            dance_command_1,  # 1
             timestep_1,  # 1
             joint_pos_n,  # NUM_JOINTS
             joint_vel_n,  # NUM_JOINTS
@@ -802,6 +837,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         commands: xax.FrozenDict[str, Array],
         carry: Array,
     ) -> tuple[Array, Array]:
+        dance_command_1 = observations["start_dance_command"]
         timestep_1 = observations["frame_timestep_observation"]
         joint_pos_n = observations["joint_position_observation"]
         joint_vel_n = observations["joint_velocity_observation"]
@@ -821,6 +857,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
 
         obs_n = jnp.concatenate(
             [
+                dance_command_1,  # 1
                 timestep_1,  # 1
                 joint_pos_n,
                 joint_vel_n / 10.0,
@@ -939,9 +976,12 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             ksim.visualize_reference_motion(
                 model=self.get_mujoco_model(),
                 reference_qpos=np.asarray(self.reference_motion.qpos.array),
-                cartesian_motion=xax.FrozenDict({
-                    body_id: np.asarray(poses.array) for body_id, poses in self.reference_motion.cartesian_poses.items()
-                }),
+                cartesian_motion=xax.FrozenDict(
+                    {
+                        body_id: np.asarray(poses.array)
+                        for body_id, poses in self.reference_motion.cartesian_poses.items()
+                    }
+                ),
                 mj_base_id=0,
             )
         else:
