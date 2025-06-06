@@ -4,6 +4,7 @@ import asyncio
 import functools
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Self
 
 import attrs
@@ -50,6 +51,12 @@ ZEROS: list[tuple[str, float, float]] = [
 class HumanoidWalkingTaskConfig(ksim.PPOConfig):
     """Config for the humanoid walking task."""
 
+    # Task parameters.
+    reference_motion_path: Path = xax.field(
+        value=Path(__file__).parent/ "assets" / "shikanoko.mjanim",
+        help="The path to the reference motion to use for the task.",
+    )
+
     # Model parameters.
     hidden_size: int = xax.field(
         value=128,
@@ -67,9 +74,9 @@ class HumanoidWalkingTaskConfig(ksim.PPOConfig):
         value=0.5,
         help="The scale for the standard deviations of the actor.",
     )
-    use_acc_gyro: bool = xax.field(
+    use_gyro: bool = xax.field(
         value=True,
-        help="Whether to use the IMU acceleration and gyroscope observations.",
+        help="Whether to use the IMU gyroscope observations.",
     )
     gait_freq_range: tuple[float, float] = xax.field(
         value=(1.2, 1.5),
@@ -286,13 +293,11 @@ class FrameTimestepObservation(ksim.TimestepObservation):
     """Observation of the phase of the timestep (matches gait phase calculation in FeetPhaseReward)."""
 
     motion_reference: ksim.MotionReferenceData
-    ctrl_dt: float = attrs.field(default=0.02)
-    
 
     def observe(self, state: ksim.ObservationInput, curriculum_level: Array, rng: PRNGKeyArray) -> Array:
         timestep = super().observe(state, curriculum_level, rng)
 
-        return jnp.mod(timestep, self.motion_reference.num_frames)
+        return jnp.mod(timestep, self.motion_reference.num_frames * self.motion_reference.ctrl_dt)
 
 @attrs.define(frozen=True, kw_only=True)
 class FeetContactObservation(ksim.FeetContactObservation):
@@ -349,7 +354,7 @@ class QposReferenceMotionReward(ksim.Reward):
 
     scale: float = 1.0
     reference_motion: ksim.MotionReferenceData
-    
+
     def get_reward(self, trajectory: ksim.Trajectory) -> Array:
         qpos_ref = self.reference_motion.get_qpos_at_time(trajectory.timestep)
         qpos = trajectory.qpos
@@ -546,7 +551,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         super().__init__(config)
         animation = MjAnim.load(config.reference_motion_path)
         qpos_sequence = animation.to_numpy(config.ctrl_dt, interp="cubic", loop=True)
-        qvel_sequence = jax.grad(lambda qpos: qpos[0])(qpos_sequence)
+        qvel_sequence = jnp.diff(qpos_sequence, axis=0) / config.ctrl_dt
         self.reference_motion = ksim.MotionReferenceData(
             qpos=xax.HashableArray(qpos_sequence),
             qvel=xax.HashableArray(qvel_sequence),
@@ -567,7 +572,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         model = mujoco_scenes.mjcf.load_mjmodel(mjcf_path, scene="smooth")
         names_to_idxs = ksim.get_geom_data_idx_by_name(model)
         model.geom_priority[names_to_idxs["floor"]] = 2.0
-        model.opt.gravity[2] = 0.0
+        model.opt.gravity[2] = -1.0
         return model
 
     def get_mujoco_model_metadata(self, mj_model: mujoco.MjModel) -> ksim.Metadata:
@@ -730,11 +735,11 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
     def get_model(self, key: PRNGKeyArray) -> Model:
         num_joints = len(ZEROS)
 
-        # timestep phase + joint pos / vel + proj_grav
-        num_actor_obs = 4 + num_joints * 2 + 3
+        # timestep + joint pos / vel + proj_grav
+        num_actor_obs = 1 + num_joints * 2 + 3
 
-        if self.config.use_acc_gyro:
-            num_actor_obs += 6
+        if self.config.use_gyro:
+            num_actor_obs += 3
 
         num_actor_inputs = num_actor_obs
 
@@ -752,8 +757,8 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             + 3  # imu_acc (privileged copies)
         )
 
-        if self.config.use_acc_gyro:
-            num_critic_inputs -= 6
+        if self.config.use_gyro:
+            num_critic_inputs -= 3
 
         return Model(
             key,
@@ -775,26 +780,20 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         commands: xax.FrozenDict[str, Array],
         carry: Array,
     ) -> tuple[distrax.Distribution, Array]:
-        timestep_phase_4 = observations["timestep_phase_observation"]
+        timestep_1 = observations["frame_timestep_observation"]
         joint_pos_n = observations["joint_position_observation"]
         joint_vel_n = observations["joint_velocity_observation"]
         proj_grav_3 = observations["projected_gravity_observation"]
-        imu_acc_3 = observations["sensor_observation_imu_acc"]
         imu_gyro_3 = observations["sensor_observation_imu_gyro"]
-        joystick_cmd_ohe_7 = commands["switching_joystick_command"]
-        gait_freq_cmd_1 = commands["gait_frequency_command"]
 
         obs = [
-            timestep_phase_4,  # 4
+            timestep_1,  # 1
             joint_pos_n,  # NUM_JOINTS
             joint_vel_n,  # NUM_JOINTS
             proj_grav_3,  # 3
-            joystick_cmd_ohe_7,  # 7
-            gait_freq_cmd_1,  # 1
         ]
-        if self.config.use_acc_gyro:
+        if self.config.use_gyro:
             obs += [
-                jnp.zeros_like(imu_acc_3),  # 3
                 imu_gyro_3,  # 3
             ]
 
@@ -810,12 +809,10 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         commands: xax.FrozenDict[str, Array],
         carry: Array,
     ) -> tuple[Array, Array]:
-        timestep_phase_4 = observations["timestep_phase_observation"]
+        timestep_1 = observations["frame_timestep_observation"]
         joint_pos_n = observations["joint_position_observation"]
         joint_vel_n = observations["joint_velocity_observation"]
         proj_grav_3 = observations["projected_gravity_observation"]
-        joystick_cmd_ohe_7 = commands["switching_joystick_command"]
-        gait_freq_cmd_1 = commands["gait_frequency_command"]
 
         # privileged obs
         imu_acc_3 = observations["sensor_observation_imu_acc"]
@@ -831,7 +828,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
 
         obs_n = jnp.concatenate(
             [
-                timestep_phase_4,  # 4
+                timestep_1,  # 1
                 joint_pos_n,
                 joint_vel_n / 10.0,
                 com_inertia_n,
@@ -845,8 +842,6 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
                 base_ang_vel_3,
                 feet_contact_4,
                 feet_position_6,
-                joystick_cmd_ohe_7,
-                gait_freq_cmd_1,
             ],
             axis=-1,
         )
