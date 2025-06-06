@@ -16,6 +16,7 @@ import ksim
 import mujoco
 import mujoco_scenes
 import mujoco_scenes.mjcf
+import numpy as np
 import optax
 import xax
 from jaxtyping import Array, PRNGKeyArray
@@ -930,6 +931,18 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         )
         action_j = action_dist_j.mode() if argmax else action_dist_j.sample(seed=rng)
         return ksim.Action(action=action_j, carry=(actor_carry, critic_carry_in))
+
+
+    def run(self) -> None:
+        if self.config.run_mode.lower() == "run_motion"
+            ksim.visualize_reference_motion(
+                model=self.get_mujoco_model(),
+                reference_qpos=np.asarray(self.reference_motion.qpos),
+                cartesian_motion=np.asarray(self.reference_motion.cartesian_poses),
+                mj_base_id=0,
+            )
+        else:
+            super().run()
 
 
 if __name__ == "__main__":
