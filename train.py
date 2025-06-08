@@ -292,7 +292,7 @@ class AnkleKneePenalty(JointPositionPenalty):
 
 @attrs.define(frozen=True, kw_only=True)
 class FrameTimestepObservation(ksim.TimestepObservation):
-    """Observation of the phase of the timestep (matches gait phase calculation in FeetPhaseReward)."""
+    """Observation of the timestep mod the length of the motion reference."""
 
     motion_reference: ksim.MotionReferenceData
 
@@ -389,13 +389,59 @@ class QposReferenceMotionReward(ksim.Reward):
     scale: float = 1.0
     reference_motion: ksim.MotionReferenceData
     command_name: str = "start_dance_command"
+    joint_weights: tuple[float, ...] = tuple([1.0] * 20)
+    # TODO: Add per joint weightings
+    # BUG: Quaternion similarity is not just per component
 
     def get_reward(self, trajectory: ksim.Trajectory) -> Array:
         command = trajectory.command[self.command_name]
-        qpos_ref = self.reference_motion.get_qpos_at_time(trajectory.timestep)
-        qpos = trajectory.qpos
-        return jnp.where(command[..., 0] > 0.0, xax.get_norm(qpos - qpos_ref, "l2").mean(axis=-1), jnp.array(0.0))
+        qpos_ref = self.reference_motion.get_qpos_at_time(trajectory.timestep)[:, 7:]
+        qpos = trajectory.qpos[:, 7:]
 
+        diff = (qpos - qpos_ref) * jnp.array(self.joint_weights)
+        joint_pos_reward = ksim.norm_to_reward(xax.get_norm(diff, "l2")).mean(axis=-1)
+
+        # Quaternion similarity
+        quat_ref = qpos_ref[:, 3:7]
+        quat = qpos[:, 3:7]
+        quat_similarity = jnp.abs(jax.vmap(jnp.dot)(quat, quat_ref))
+
+        total_reward = joint_pos_reward + quat_similarity
+        return jnp.where(command[..., 0] > 0.0, total_reward, jnp.array(0.0))
+
+@attrs.define(frozen=True, kw_only=True)
+class QvelReferenceMotionReward(ksim.Reward):
+    """Reward for matching the reference motion."""
+
+    scale: float = 1.0
+    reference_motion: ksim.MotionReferenceData
+    command_name: str = "start_dance_command"
+    joint_weights: tuple[float, ...] = tuple([1.0] * 20)
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
+        command = trajectory.command[self.command_name]
+        step = jnp.round(trajectory.timestep / self.reference_motion.ctrl_dt).astype(int)
+        max_qvel_step = self.reference_motion.qvel.array.shape[0] - 1
+        safe_step = jnp.clip(step, 0, max_qvel_step)
+
+        qvel_ref = self.reference_motion.get_qvel_at_step(safe_step)[:, 7:]
+        qvel = trajectory.qvel[:, 6:]
+
+        # Debug: Check for NaN/inf in inputs
+        qvel_safe = jnp.nan_to_num(qvel, nan=0.0, posinf=1e6, neginf=-1e6)
+        qvel_ref_safe = jnp.nan_to_num(qvel_ref, nan=0.0, posinf=1e6, neginf=-1e6)
+
+        qvel_diff = (qvel_safe - qvel_ref_safe) * jnp.array(self.joint_weights)
+
+        # Clip extreme values to prevent overflow in norm computation
+        qvel_diff = jnp.clip(qvel_diff, -1e3, 1e3)
+
+        norm_val = xax.get_norm(qvel_diff, "l2")
+        # Ensure norm is finite
+        norm_val = jnp.clip(norm_val, 1e-8, 1e3)
+
+        joint_vel_reward = ksim.norm_to_reward(norm_val).mean(axis=-1)
+        return jnp.where(command[..., 0] > 0.0, joint_vel_reward, jnp.array(0.0))
 
 class Actor(eqx.Module):
     """Actor for the walking task."""
@@ -719,7 +765,34 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         return [
             # Standard rewards.
             ksim.StayAliveReward(scale=5.0),
-            QposReferenceMotionReward(scale=1.0, reference_motion=self.reference_motion),
+            ksim.UprightReward(scale=3.0),
+            QposReferenceMotionReward(scale=1.0, reference_motion=self.reference_motion,
+                                      joint_weights=(
+                                                    # right arm
+                                                     2.0,
+                                                     2.0,
+                                                     2.0,
+                                                     2.0,
+                                                     2.0,
+                                                     # left arm
+                                                     2.0,
+                                                     2.0,
+                                                     2.0,
+                                                     2.0,
+                                                     2.0,
+                                                     # right leg
+                                                     1.0,
+                                                     1.0,
+                                                     1.0,
+                                                     1.0,
+                                                     1.0,
+                                                     # left leg
+                                                     1.0,
+                                                     1.0,
+                                                     1.0,
+                                                     1.0,
+                                                     1.0)),
+            QvelReferenceMotionReward(scale=0.2, reference_motion=self.reference_motion),
             # Normalisation penalties.
             # ksim.AvoidLimitsPenalty.create(physics_model, scale=-0.01, scale_by_curriculum=True),
             # ksim.JointAccelerationPenalty(scale=-0.02, scale_by_curriculum=True),
@@ -730,7 +803,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             # ActionVelocityPenalty(scale=-1 * self.config.action_vel, scale_by_curriculum=True),
             # ksim.LinkJerkPenalty(scale=-0.02, scale_by_curriculum=True),
             # ksim.AngularVelocityPenalty(index=("x", "y"), scale=-0.5, scale_by_curriculum=True),
-            # ksim.LinearVelocityPenalty(index=("z",), scale=-0.5, scale_by_curriculum=True),
+            ksim.LinearVelocityPenalty(index=("z","x","y"), scale=-0.5, scale_by_curriculum=True),
             # ksim.CtrlPenalty(scale=-0.01, scale_by_curriculum=True),
             # Bespoke rewards.
             # FeetSlipPenalty(scale=-0.25),
@@ -760,7 +833,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         num_joints = len(ZEROS)
 
         # timestep + joint pos / vel + proj_grav
-        num_actor_obs = 1 + num_joints * 2 + 3
+        num_actor_obs = 1 + num_joints * 2 + 3 + 27
 
         num_commands = 1
 
@@ -811,7 +884,19 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         joint_vel_n = observations["joint_velocity_observation"]
         proj_grav_3 = observations["projected_gravity_observation"]
         imu_gyro_3 = observations["sensor_observation_imu_gyro"]
-        dance_command_1 = observations["start_dance_command"]
+        dance_command_1 = commands["start_dance_command"]
+        reference_motion_27 = self.reference_motion.get_qpos_at_time(timestep_1).squeeze(0)
+
+        # Privileged obs to just test the task
+        # feet_contact_4 = observations["feet_contact_observation"]
+        # feet_position_6 = observations["feet_position_observation"]
+        # base_position_3 = observations["base_position_observation"]
+        # base_orientation_4 = observations["base_orientation_observation"]
+        # com_inertia_n = observations["center_of_mass_inertia_observation"]
+        # com_vel_n = observations["center_of_mass_velocity_observation"]
+        # base_lin_vel_3 = observations["base_linear_velocity_observation"]
+        # base_ang_vel_3 = observations["base_angular_velocity_observation"]
+        # actuator_force_n = observations["actuator_force_observation"]
 
         obs = [
             dance_command_1,  # 1
@@ -819,6 +904,17 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             joint_pos_n,  # NUM_JOINTS
             joint_vel_n,  # NUM_JOINTS
             proj_grav_3,  # 3
+            reference_motion_27,  # 27
+            # temp (delete this)
+            # feet_contact_4,  # 4
+            # feet_position_6,  # 6
+            # base_position_3,  # 3
+            # base_orientation_4,  # 4
+            # com_inertia_n,  # 3
+            # com_vel_n,  # 3
+            # base_lin_vel_3,  # 3
+            # base_ang_vel_3,  # 3
+            # actuator_force_n,  # NUM_JOINTS
         ]
         if self.config.use_gyro:
             obs += [
@@ -837,11 +933,12 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         commands: xax.FrozenDict[str, Array],
         carry: Array,
     ) -> tuple[Array, Array]:
-        dance_command_1 = observations["start_dance_command"]
+        dance_command_1 = commands["start_dance_command"]
         timestep_1 = observations["frame_timestep_observation"]
         joint_pos_n = observations["joint_position_observation"]
         joint_vel_n = observations["joint_velocity_observation"]
         proj_grav_3 = observations["projected_gravity_observation"]
+        reference_motion_27 = self.reference_motion.get_qpos_at_time(timestep_1).squeeze(0)
 
         # privileged obs
         imu_acc_3 = observations["sensor_observation_imu_acc"]
@@ -861,6 +958,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
                 timestep_1,  # 1
                 joint_pos_n,
                 joint_vel_n / 10.0,
+                reference_motion_27,
                 com_inertia_n,
                 com_vel_n,
                 imu_acc_3,
