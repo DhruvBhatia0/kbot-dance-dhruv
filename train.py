@@ -199,6 +199,113 @@ class QvelReferenceMotionReward(ksim.Reward):
         return joint_vel_reward
 
 
+# ------------- Helper Quaternion Utilities -------------
+# NOTE: MuJoCo uses scalar-first quaternions (w, x, y, z)
+
+
+def _quat_conjugate(q: Array) -> Array:  # shape (..., 4)
+    """Quaternion conjugate (inverse for unit quaternions)."""
+    return q.at[..., 1:].multiply(-1.0)
+
+
+def _quat_multiply(q1: Array, q2: Array) -> Array:
+    """Hamilton product of two quaternions (w, x, y, z)."""
+    w1, x1, y1, z1 = jnp.split(q1, 4, axis=-1)
+    w2, x2, y2, z2 = jnp.split(q2, 4, axis=-1)
+    w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+    x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+    y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+    z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+    return jnp.concatenate([w, x, y, z], axis=-1)
+
+
+# ------------- New Rewards -------------
+
+
+@attrs.define(frozen=True, kw_only=True)
+class RposReferenceMotionReward(ksim.Reward):
+    """Reward for matching relative body positions to the reference motion."""
+
+    scale: float = 1.0
+    reference_rpos: xax.HashableArray  # [T, n_bodies-1, 3]
+    ctrl_dt: float
+
+    @property
+    def num_frames(self) -> int:
+        return self.reference_rpos.array.shape[0]
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
+        # Current relative body positions (exclude root/pelvis which is index 0)
+        body_pos = trajectory.xpos  # [B, n_bodies, 3]
+        rel_pos = body_pos[:, 1:, :] - body_pos[:, :1, :]  # [B, n_bodies-1, 3]
+
+        # Reference relative positions at the corresponding frame
+        step_number = jnp.int32(jnp.round(trajectory.timestep / self.ctrl_dt)) % self.num_frames
+        ref_rpos = jnp.take(self.reference_rpos.array, step_number, axis=0)  # [B, n_bodies-1, 3]
+
+        diff = rel_pos - ref_rpos
+        # Mean squared error across bodies and axes
+        mse = jnp.mean(jnp.square(diff), axis=(-1, -2))
+        reward = jnp.exp(-100.0 * mse)  # weight inside expo similar to DeepMimic
+        return reward
+
+
+@attrs.define(frozen=True, kw_only=True)
+class RquatReferenceMotionReward(ksim.Reward):
+    """Reward for matching relative body orientations to the reference motion."""
+
+    scale: float = 1.0
+    reference_rel_quat: xax.HashableArray  # [T, n_bodies-1, 4] scalar-first quats
+    ctrl_dt: float
+
+    @property
+    def num_frames(self) -> int:
+        return self.reference_rel_quat.array.shape[0]
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
+        body_quat = trajectory.xquat  # [B, n_bodies, 4]
+        root_quat = body_quat[:, :1, :]  # [B,1,4]
+        root_conj = _quat_conjugate(root_quat)
+        # Broadcast multiply to obtain relative quats: q_rel = q_root^* * q_body
+        rel_quat = _quat_multiply(jnp.broadcast_to(root_conj, body_quat[:, 1:, :].shape), body_quat[:, 1:, :])
+
+        # Reference relative quats
+        step_number = jnp.int32(jnp.round(trajectory.timestep / self.ctrl_dt)) % self.num_frames
+        ref_rel_quat = jnp.take(self.reference_rel_quat.array, step_number, axis=0)
+
+        # Angular distance via quaternion dot product
+        dot = jnp.abs(jnp.sum(rel_quat * ref_rel_quat, axis=-1))  # [B, n_bodies-1]
+        dot = jnp.clip(dot, 0.0, 1.0)
+        ang = 2.0 * jnp.arccos(dot)  # radians, in [0, pi]
+        mean_ang = jnp.mean(ang, axis=-1)
+        reward = jnp.exp(-10.0 * mean_ang)  # lower weight than position
+        return reward
+
+
+@attrs.define(frozen=True, kw_only=True)
+class RvelReferenceMotionReward(ksim.Reward):
+    """Reward for matching root 6-DoF velocities to the reference motion (proxy for site velocities)."""
+
+    scale: float = 1.0
+    reference_root_qvel: xax.HashableArray  # [T, 6]
+    ctrl_dt: float
+
+    @property
+    def num_frames(self) -> int:
+        return self.reference_root_qvel.array.shape[0]
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
+        root_vel = trajectory.qvel[:, :6]  # [B, 6]
+        step_number = jnp.int32(jnp.round(trajectory.timestep / self.ctrl_dt)) % self.num_frames
+        ref_root_vel = jnp.take(self.reference_root_qvel.array, step_number, axis=0)  # [B, 6]
+
+        diff = root_vel - ref_root_vel
+        # Collapse the 6-D velocity error into a scalar per sample first
+        norm_val = jnp.linalg.norm(diff, axis=-1)  # [B]
+        reward = ksim.norm_to_reward(norm_val)
+        return reward
+
+
 class Actor(eqx.Module):
     """Actor for the walking task."""
 
@@ -466,7 +573,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
     def get_rewards(self, physics_model: ksim.PhysicsModel) -> list[ksim.Reward]:
         return [
             QposReferenceMotionReward(
-                scale=1.0,
+                scale=0.4,
                 reference_motion=self.reference_motion,
                 joint_weights=(
                     # right arm
@@ -496,6 +603,13 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
                 ),
             ),
             QvelReferenceMotionReward(scale=0.2, reference_motion=self.reference_motion),
+            RposReferenceMotionReward(scale=0.5, reference_rpos=self.reference_rpos, ctrl_dt=self.config.ctrl_dt),
+            RquatReferenceMotionReward(
+                scale=0.3, reference_rel_quat=self.reference_rel_quat, ctrl_dt=self.config.ctrl_dt
+            ),
+            RvelReferenceMotionReward(
+                scale=0.1, reference_root_qvel=self.reference_root_qvel, ctrl_dt=self.config.ctrl_dt
+            ),
         ]
 
     def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:
@@ -684,6 +798,10 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         animation = MjAnim.load(self.config.reference_motion_path)
         qpos_sequence = animation.to_numpy(self.config.ctrl_dt, interp="cubic", loop=True)
 
+        # Z axis offset
+        z_offset = -0.03
+        qpos_sequence[:, 2] += z_offset
+
         mj_model = self.get_mujoco_model()
         qvel_list = []
         for i in range(len(qpos_sequence) - 1):
@@ -698,6 +816,54 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             cartesian_poses=xax.FrozenDict({}),
             ctrl_dt=self.config.ctrl_dt,
         )
+
+        # ----- Precompute reference relative body metrics -----
+        n_frames = self.reference_motion.qpos.array.shape[0]
+        n_bodies = mj_model.nbody
+        rel_pos_list = []
+        rel_quat_list = []
+        rel_cvel_list = []
+
+        data = mujoco.MjData(mj_model)
+        for f in range(n_frames):
+            data.qpos[:] = qpos_sequence[f]
+            data.qvel[:] = qvel_sequence[min(f, qvel_sequence.shape[0] - 1)]
+            mujoco.mj_forward(mj_model, data)
+
+            body_pos = np.copy(data.xpos)  # (n_bodies,3)
+            body_quat = np.copy(data.xquat)  # (n_bodies,4) scalar-first
+            body_cvel = np.copy(data.cvel)  # (n_bodies,6)
+
+            root_pos = body_pos[0]
+            root_quat = body_quat[0]
+            root_cvel = body_cvel[0]
+
+            rel_pos = body_pos[1:] - root_pos  # (n_bodies-1,3)
+            # compute relative quats
+            root_conj = np.array([root_quat[0], -root_quat[1], -root_quat[2], -root_quat[3]])
+            root_conj_tile = np.tile(root_conj[None, :], (n_bodies - 1, 1))
+
+            # Hamilton product in numpy
+            def quat_mul_np(q1, q2):
+                w1, x1, y1, z1 = np.split(q1, 4, axis=-1)
+                w2, x2, y2, z2 = np.split(q2, 4, axis=-1)
+                w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+                x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+                y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+                z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+                return np.concatenate([w, x, y, z], axis=-1)
+
+            rel_quat = quat_mul_np(root_conj_tile, body_quat[1:])
+
+            rel_cvel = body_cvel[1:] - root_cvel  # proxy relative vel
+
+            rel_pos_list.append(rel_pos)
+            rel_quat_list.append(rel_quat)
+            rel_cvel_list.append(rel_cvel)
+
+        self.reference_rpos = xax.HashableArray(jnp.array(rel_pos_list))
+        self.reference_rel_quat = xax.HashableArray(jnp.array(rel_quat_list))
+        self.reference_root_qvel = xax.HashableArray(self.reference_motion.qvel.array[:, :6])
 
         if self.config.run_mode.lower() == "view_motion":
             ksim.visualize_reference_motion(
