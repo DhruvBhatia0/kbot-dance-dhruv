@@ -139,14 +139,46 @@ class FrameTimestepObservation(ksim.TimestepObservation):
         return jnp.mod(timestep, self.motion_reference.num_frames * self.motion_reference.ctrl_dt)
 
 
+def quat_dot(q1, q2):
+    """Dot product shape (...,4)."""
+    return jnp.sum(q1 * q2, axis=-1)
+
+
+def quat_conj(q):
+    """Conjugate keeps w, flips xyz."""
+    return q * jnp.array([1.0, -1.0, -1.0, -1.0])
+
+
+def quat_mul(a, b):
+    """Hamilton product shape (...,4)."""
+    w1, x1, y1, z1 = jnp.moveaxis(a, -1, 0)
+    w2, x2, y2, z2 = jnp.moveaxis(b, -1, 0)
+    w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+    x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+    y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+    z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+    return jnp.stack([w, x, y, z], axis=-1)
+
+
+def quat_angle_error(q, q_ref):
+    """
+    Smallest angular distance (rad) between two unit quats.
+    """
+    # Use dot, deal with double cover by abs, clamp for numerical safety
+    cos_half_theta = jnp.clip(jnp.abs(quat_dot(q, q_ref)), 0.0, 1.0)
+    return 2.0 * jnp.arccos(cos_half_theta)
+
+
+def angle_to_reward(angle, sharpness=5.0):
+    return jnp.exp(-sharpness * angle**2)
+
+
 @attrs.define(frozen=True, kw_only=True)
 class QposReferenceMotionReward(ksim.Reward):
     """Reward for matching the reference motion."""
 
     scale: float = 1.0
     reference_motion: ksim.MotionReferenceData
-    joint_weights: tuple[float, ...] = tuple([1.0] * 20)
-    # TODO: Add per joint weightings
     # BUG: Quaternion similarity is not just per component
 
     def get_reward(self, trajectory: ksim.Trajectory) -> Array:
@@ -154,15 +186,17 @@ class QposReferenceMotionReward(ksim.Reward):
         qpos_ref_joints = full_qpos_ref[:, 7:]
         qpos_joints = trajectory.qpos[:, 7:]
 
-        diff = (qpos_joints - qpos_ref_joints) * jnp.array(self.joint_weights)
+        diff = qpos_joints - qpos_ref_joints
         joint_pos_reward = ksim.norm_to_reward(xax.get_norm(diff, "l2")).mean(axis=-1)
 
         # Quaternion similarity
         quat_ref = full_qpos_ref[:, 3:7]
         quat = trajectory.qpos[:, 3:7]
-        quat_similarity = jnp.abs(jax.vmap(jnp.dot)(quat, quat_ref))
 
-        total_reward = joint_pos_reward + quat_similarity
+        ang_err = quat_angle_error(quat, quat_ref)  # shape (batch,)
+        quat_r = angle_to_reward(ang_err, sharpness=5)
+
+        total_reward = joint_pos_reward + quat_r
         return total_reward
 
 
@@ -172,7 +206,6 @@ class QvelReferenceMotionReward(ksim.Reward):
 
     scale: float = 1.0
     reference_motion: ksim.MotionReferenceData
-    joint_weights: tuple[float, ...] = tuple([1.0] * 20)
 
     def get_reward(self, trajectory: ksim.Trajectory) -> Array:
         step = jnp.round(trajectory.timestep / self.reference_motion.ctrl_dt).astype(int)
@@ -186,7 +219,7 @@ class QvelReferenceMotionReward(ksim.Reward):
         qvel_safe = jnp.nan_to_num(qvel, nan=0.0, posinf=1e6, neginf=-1e6)
         qvel_ref_safe = jnp.nan_to_num(qvel_ref, nan=0.0, posinf=1e6, neginf=-1e6)
 
-        qvel_diff = (qvel_safe - qvel_ref_safe) * jnp.array(self.joint_weights)
+        qvel_diff = qvel_safe - qvel_ref_safe
 
         # Clip extreme values to prevent overflow in norm computation
         qvel_diff = jnp.clip(qvel_diff, -1e3, 1e3)
@@ -468,32 +501,6 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             QposReferenceMotionReward(
                 scale=1.0,
                 reference_motion=self.reference_motion,
-                joint_weights=(
-                    # right arm
-                    2.0,
-                    2.0,
-                    2.0,
-                    2.0,
-                    2.0,
-                    # left arm
-                    2.0,
-                    2.0,
-                    2.0,
-                    2.0,
-                    2.0,
-                    # right leg
-                    1.0,
-                    1.0,
-                    1.0,
-                    1.0,
-                    1.0,
-                    # left leg
-                    1.0,
-                    1.0,
-                    1.0,
-                    1.0,
-                    1.0,
-                ),
             ),
             QvelReferenceMotionReward(scale=0.2, reference_motion=self.reference_motion),
         ]
@@ -684,6 +691,9 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         animation = MjAnim.load(self.config.reference_motion_path)
         qpos_sequence = animation.to_numpy(self.config.ctrl_dt, interp="cubic", loop=True)
 
+        z_offset = -0.03
+        qpos_sequence[:, 2] += z_offset
+
         mj_model = self.get_mujoco_model()
         qvel_list = []
         for i in range(len(qpos_sequence) - 1):
@@ -700,6 +710,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         )
 
         if self.config.run_mode.lower() == "view_motion":
+            print(self.reference_motion.qpos.array[0])
             ksim.visualize_reference_motion(
                 model=self.get_mujoco_model(),
                 reference_qpos=np.asarray(self.reference_motion.qpos.array),
