@@ -196,7 +196,15 @@ class QposReferenceMotionReward(ksim.Reward):
         ang_err = quat_angle_error(quat, quat_ref)  # shape (batch,)
         quat_r = angle_to_reward(ang_err, sharpness=5)
 
-        total_reward = joint_pos_reward + quat_r
+        # Root body reward
+        root_pos_ref = full_qpos_ref[
+            :, :3
+        ]  # verified that the trajectory I am testing with starts at 0,0 so this should be fine
+        root_pos = trajectory.qpos[:, :3]
+        root_pos_diff = root_pos - root_pos_ref
+        root_pos_reward = ksim.norm_to_reward(xax.get_norm(root_pos_diff, "l2")).mean(axis=-1)
+
+        total_reward = joint_pos_reward + quat_r + root_pos_reward
         return total_reward
 
 
@@ -229,7 +237,15 @@ class QvelReferenceMotionReward(ksim.Reward):
         norm_val = jnp.clip(norm_val, 1e-8, 1e3)
 
         joint_vel_reward = ksim.norm_to_reward(norm_val).mean(axis=-1)
-        return joint_vel_reward
+
+        # calculate difference in root's velocity, linear and angular. Think we can just use l2 here
+        root_vel_ref = self.reference_motion.get_qvel_at_step(safe_step)[:, :6]
+        root_vel = trajectory.qvel[:, :6]
+        root_vel_diff = root_vel - root_vel_ref
+        root_vel_reward = ksim.norm_to_reward(xax.get_norm(root_vel_diff, "l2")).mean(axis=-1)
+
+        total_reward = joint_vel_reward + root_vel_reward
+        return total_reward
 
 
 class Actor(eqx.Module):
