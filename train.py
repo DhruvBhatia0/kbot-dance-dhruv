@@ -179,33 +179,28 @@ class QposReferenceMotionReward(ksim.Reward):
 
     scale: float = 1.0
     reference_motion: ksim.MotionReferenceData
-    # BUG: Quaternion similarity is not just per component
+    w_exp: float = 10.0  # exponential weight (same default as jax_rl_mimic)
 
     def get_reward(self, trajectory: ksim.Trajectory) -> Array:
+        # Reference pose at this timestep
         full_qpos_ref = self.reference_motion.get_qpos_at_time(trajectory.timestep)
+
+        # --- Joint position tracking (exclude floating root 7 DoF) ---
         qpos_ref_joints = full_qpos_ref[:, 7:]
         qpos_joints = trajectory.qpos[:, 7:]
+        joint_pos_err = jnp.square(qpos_joints - qpos_ref_joints).mean(axis=-1)
 
-        diff = qpos_joints - qpos_ref_joints
-        joint_pos_reward = ksim.norm_to_reward(xax.get_norm(diff, "l2")).mean(axis=-1)
-
-        # Quaternion similarity
+        # --- Root orientation tracking ---
         quat_ref = full_qpos_ref[:, 3:7]
         quat = trajectory.qpos[:, 3:7]
-
         ang_err = quat_angle_error(quat, quat_ref)  # shape (batch,)
-        quat_r = angle_to_reward(ang_err, sharpness=5)
 
-        # Root body reward
-        # root_pos_ref = full_qpos_ref[
-        #     :, :3
-        # ]  # verified that the trajectory I am testing with starts at 0,0 so this should be fine
-        # root_pos = trajectory.qpos[:, :3]
-        # root_pos_diff = root_pos - root_pos_ref
-        # root_pos_reward = ksim.norm_to_reward(xax.get_norm(root_pos_diff, "l2")).mean(axis=-1)
+        # Combine errors exactly like DeepMimic (sum them, then exponentiate)
+        qpos_dist = joint_pos_err + ang_err
 
-        total_reward = joint_pos_reward + quat_r
-        return total_reward
+        # Exponential mapping to reward
+        qpos_reward = jnp.exp(-self.w_exp * qpos_dist)
+        return qpos_reward
 
 
 @attrs.define(frozen=True, kw_only=True)
@@ -214,91 +209,23 @@ class QvelReferenceMotionReward(ksim.Reward):
 
     scale: float = 1.0
     reference_motion: ksim.MotionReferenceData
+    w_exp: float = 2.0  # exponential weight (matches jax_rl_mimic default)
 
     def get_reward(self, trajectory: ksim.Trajectory) -> Array:
         step = jnp.round(trajectory.timestep / self.reference_motion.ctrl_dt).astype(int)
         max_qvel_step = self.reference_motion.qvel.array.shape[0] - 1
         safe_step = jnp.clip(step, 0, max_qvel_step)
 
-        qvel_ref = self.reference_motion.get_qvel_at_step(safe_step)[:, 6:]
-        qvel = trajectory.qvel[:, 6:]
+        # Retrieve full reference qvel (root + joints)
+        qvel_ref = self.reference_motion.get_qvel_at_step(safe_step)
+        qvel = trajectory.qvel
 
-        # Debug: Check for NaN/inf in inputs
-        qvel_safe = jnp.nan_to_num(qvel, nan=0.0, posinf=1e6, neginf=-1e6)
-        qvel_ref_safe = jnp.nan_to_num(qvel_ref, nan=0.0, posinf=1e6, neginf=-1e6)
+        # Mean-squared velocity error across all DoFs (same as DeepMimic)
+        vel_dist = jnp.mean(jnp.square(qvel - qvel_ref), axis=-1)
 
-        qvel_diff = qvel_safe - qvel_ref_safe
-
-        # Clip extreme values to prevent overflow in norm computation
-        qvel_diff = jnp.clip(qvel_diff, -1e3, 1e3)
-
-        norm_val = xax.get_norm(qvel_diff, "l2")
-        # Ensure norm is finite
-        norm_val = jnp.clip(norm_val, 1e-8, 1e3)
-
-        joint_vel_reward = ksim.norm_to_reward(norm_val).mean(axis=-1)
-
-        # calculate difference in root's velocity, linear and angular. Think we can just use l2 here
-        root_vel_ref = self.reference_motion.get_qvel_at_step(safe_step)[:, :6]
-        root_vel = trajectory.qvel[:, :6]
-        root_vel_diff = root_vel - root_vel_ref
-        root_vel_reward = ksim.norm_to_reward(xax.get_norm(root_vel_diff, "l2")).mean(axis=-1)
-
-        total_reward = joint_vel_reward + root_vel_reward
-        return total_reward
-
-
-@attrs.define(frozen=True, kw_only=True)
-class RelativeXposReferenceMotionReward(ksim.Reward):
-    """Reward for matching relative body positions (xpos) to reference motion."""
-
-    scale: float = 1.0
-    reference_motion: ksim.MotionReferenceData
-    root_body_idx: int = 0
-
-    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
-        # Reference relative xpos sequence: shape (T, nbody, 3)
-        rel_xpos_ref_seq = self.reference_motion.cartesian_poses["rel_xpos"].array
-
-        # Convert timestep to index into reference motion
-        step = jnp.round(trajectory.timestep / self.reference_motion.ctrl_dt).astype(int)
-        max_step = rel_xpos_ref_seq.shape[0] - 1
-        safe_step = jnp.clip(step, 0, max_step)
-
-        # Gather reference relative positions for current timestep
-        ref_rel_xpos = rel_xpos_ref_seq[safe_step]
-
-        # Compute relative xpos in the root body frame (translation + rotation)
-        root_pos = trajectory.xpos[..., self.root_body_idx, :]
-        root_quat = trajectory.xquat[..., self.root_body_idx, :]
-
-        # Translate to root origin
-        translated_pos = trajectory.xpos - root_pos[:, None, :]  # (..., nbody, 3)
-
-        # Rotate to root frame using quaternion rotation
-        # For each timestep, rotate all body positions by inverse of root quaternion
-        def rotate_to_root_frame(pos, quat):
-            # pos: (..., nbody, 3), quat: (..., 4)
-            # We want to rotate by inverse quaternion: q_conj
-            quat_conj_expanded = quat_conj(quat)[:, None, :]  # (..., 1, 4)
-
-            # Convert 3D positions to quaternions (w=0, xyz=pos)
-            zeros = jnp.zeros((*pos.shape[:-1], 1))  # (..., nbody, 1)
-            pos_quat = jnp.concatenate([zeros, pos], axis=-1)  # (..., nbody, 4)
-
-            # Rotate: q_conj * pos_quat * q
-            rotated_quat = quat_mul(quat_mul(quat_conj_expanded, pos_quat), quat[:, None, :])
-            return rotated_quat[..., 1:]  # Extract xyz components
-
-        traj_rel_xpos = rotate_to_root_frame(translated_pos, root_quat)
-
-        diff = traj_rel_xpos - ref_rel_xpos  # shape (batch, nbody, 3)
-
-        # L2 norm over xyz, then mean over bodies -> scalar per timestep
-        per_body_error = jnp.linalg.norm(diff, axis=-1)  # (batch, nbody)
-        rel_pos_reward = ksim.norm_to_reward(per_body_error).mean(axis=-1)
-
-        return rel_pos_reward
+        # Exponential mapping to reward
+        qvel_reward = jnp.exp(-self.w_exp * vel_dist)
+        return qvel_reward
 
 
 class Actor(eqx.Module):
@@ -572,11 +499,6 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
                 reference_motion=self.reference_motion,
             ),
             QvelReferenceMotionReward(scale=0.2, reference_motion=self.reference_motion),
-            RelativeXposReferenceMotionReward(
-                scale=1.0,
-                reference_motion=self.reference_motion,
-                root_body_idx=0,
-            ),
         ]
 
     def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:
@@ -774,7 +696,6 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         qvel_list = []
         xpos_list = []
         xquat_list = []
-        rel_xpos_list = []
 
         for i in range(len(qpos_sequence) - 1):
             # Compute qvel using finite differences
@@ -790,17 +711,9 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             xpos_list.append(mj_data.xpos.copy())
             xquat_list.append(mj_data.xquat.copy())
 
-            # Compute relative xpos in the root body frame (translation + rotation)
-            root_pos = mj_data.xpos[0].copy()
-            root_quat = mj_data.xquat[0].copy()
-            root_mat = ksim.utils.mujoco.quat_to_mat(root_quat)
-            rel_pos = (mj_data.xpos - root_pos) @ root_mat.T  # world -> root-frame
-            rel_xpos_list.append(rel_pos.copy())
-
         qvel_sequence = jnp.array(qvel_list)
         xpos_sequence = jnp.array(xpos_list)
         xquat_sequence = jnp.array(xquat_list)
-        rel_xpos_sequence = jnp.array(rel_xpos_list)
 
         self.reference_motion = ksim.MotionReferenceData(
             qpos=xax.HashableArray(qpos_sequence[:-1]),
@@ -809,7 +722,6 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
                 {
                     "xpos": xax.HashableArray(xpos_sequence),
                     "xquat": xax.HashableArray(xquat_sequence),
-                    "rel_xpos": xax.HashableArray(rel_xpos_sequence),
                 }
             ),
             ctrl_dt=self.config.ctrl_dt,
