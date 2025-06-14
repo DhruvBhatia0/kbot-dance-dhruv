@@ -197,14 +197,14 @@ class QposReferenceMotionReward(ksim.Reward):
         quat_r = angle_to_reward(ang_err, sharpness=5)
 
         # Root body reward
-        root_pos_ref = full_qpos_ref[
-            :, :3
-        ]  # verified that the trajectory I am testing with starts at 0,0 so this should be fine
-        root_pos = trajectory.qpos[:, :3]
-        root_pos_diff = root_pos - root_pos_ref
-        root_pos_reward = ksim.norm_to_reward(xax.get_norm(root_pos_diff, "l2")).mean(axis=-1)
+        # root_pos_ref = full_qpos_ref[
+        #     :, :3
+        # ]  # verified that the trajectory I am testing with starts at 0,0 so this should be fine
+        # root_pos = trajectory.qpos[:, :3]
+        # root_pos_diff = root_pos - root_pos_ref
+        # root_pos_reward = ksim.norm_to_reward(xax.get_norm(root_pos_diff, "l2")).mean(axis=-1)
 
-        total_reward = joint_pos_reward + quat_r + root_pos_reward
+        total_reward = joint_pos_reward + quat_r
         return total_reward
 
 
@@ -246,6 +246,59 @@ class QvelReferenceMotionReward(ksim.Reward):
 
         total_reward = joint_vel_reward + root_vel_reward
         return total_reward
+
+
+@attrs.define(frozen=True, kw_only=True)
+class RelativeXposReferenceMotionReward(ksim.Reward):
+    """Reward for matching relative body positions (xpos) to reference motion."""
+
+    scale: float = 1.0
+    reference_motion: ksim.MotionReferenceData
+    root_body_idx: int = 0
+
+    def get_reward(self, trajectory: ksim.Trajectory) -> Array:
+        # Reference relative xpos sequence: shape (T, nbody, 3)
+        rel_xpos_ref_seq = self.reference_motion.cartesian_poses["rel_xpos"].array
+
+        # Convert timestep to index into reference motion
+        step = jnp.round(trajectory.timestep / self.reference_motion.ctrl_dt).astype(int)
+        max_step = rel_xpos_ref_seq.shape[0] - 1
+        safe_step = jnp.clip(step, 0, max_step)
+
+        # Gather reference relative positions for current timestep
+        ref_rel_xpos = rel_xpos_ref_seq[safe_step]
+
+        # Compute relative xpos in the root body frame (translation + rotation)
+        root_pos = trajectory.xpos[..., self.root_body_idx, :]
+        root_quat = trajectory.xquat[..., self.root_body_idx, :]
+
+        # Translate to root origin
+        translated_pos = trajectory.xpos - root_pos[:, None, :]  # (..., nbody, 3)
+
+        # Rotate to root frame using quaternion rotation
+        # For each timestep, rotate all body positions by inverse of root quaternion
+        def rotate_to_root_frame(pos, quat):
+            # pos: (..., nbody, 3), quat: (..., 4)
+            # We want to rotate by inverse quaternion: q_conj
+            quat_conj_expanded = quat_conj(quat)[:, None, :]  # (..., 1, 4)
+
+            # Convert 3D positions to quaternions (w=0, xyz=pos)
+            zeros = jnp.zeros((*pos.shape[:-1], 1))  # (..., nbody, 1)
+            pos_quat = jnp.concatenate([zeros, pos], axis=-1)  # (..., nbody, 4)
+
+            # Rotate: q_conj * pos_quat * q
+            rotated_quat = quat_mul(quat_mul(quat_conj_expanded, pos_quat), quat[:, None, :])
+            return rotated_quat[..., 1:]  # Extract xyz components
+
+        traj_rel_xpos = rotate_to_root_frame(translated_pos, root_quat)
+
+        diff = traj_rel_xpos - ref_rel_xpos  # shape (batch, nbody, 3)
+
+        # L2 norm over xyz, then mean over bodies -> scalar per timestep
+        per_body_error = jnp.linalg.norm(diff, axis=-1)  # (batch, nbody)
+        rel_pos_reward = ksim.norm_to_reward(per_body_error).mean(axis=-1)
+
+        return rel_pos_reward
 
 
 class Actor(eqx.Module):
@@ -519,6 +572,11 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
                 reference_motion=self.reference_motion,
             ),
             QvelReferenceMotionReward(scale=0.2, reference_motion=self.reference_motion),
+            RelativeXposReferenceMotionReward(
+                scale=1.0,
+                reference_motion=self.reference_motion,
+                root_body_idx=0,
+            ),
         ]
 
     def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:
@@ -711,17 +769,49 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         qpos_sequence[:, 2] += z_offset
 
         mj_model = self.get_mujoco_model()
+        mj_data = mujoco.MjData(mj_model)
+
         qvel_list = []
+        xpos_list = []
+        xquat_list = []
+        rel_xpos_list = []
+
         for i in range(len(qpos_sequence) - 1):
+            # Compute qvel using finite differences
             qvel = np.zeros(mj_model.nv)
             mujoco.mj_differentiatePos(mj_model, qvel, self.config.ctrl_dt, qpos_sequence[i], qpos_sequence[i + 1])
             qvel_list.append(qvel)
+
+            # Set qpos and compute forward kinematics to get xpos and xquat
+            mj_data.qpos = qpos_sequence[i]
+            mujoco.mj_forward(mj_model, mj_data)
+
+            # Extract xpos and xquat for all bodies
+            xpos_list.append(mj_data.xpos.copy())
+            xquat_list.append(mj_data.xquat.copy())
+
+            # Compute relative xpos in the root body frame (translation + rotation)
+            root_pos = mj_data.xpos[0].copy()
+            root_quat = mj_data.xquat[0].copy()
+            root_mat = ksim.utils.mujoco.quat_to_mat(root_quat)
+            rel_pos = (mj_data.xpos - root_pos) @ root_mat.T  # world -> root-frame
+            rel_xpos_list.append(rel_pos.copy())
+
         qvel_sequence = jnp.array(qvel_list)
+        xpos_sequence = jnp.array(xpos_list)
+        xquat_sequence = jnp.array(xquat_list)
+        rel_xpos_sequence = jnp.array(rel_xpos_list)
 
         self.reference_motion = ksim.MotionReferenceData(
             qpos=xax.HashableArray(qpos_sequence[:-1]),
             qvel=xax.HashableArray(qvel_sequence),
-            cartesian_poses=xax.FrozenDict({}),
+            cartesian_poses=xax.FrozenDict(
+                {
+                    "xpos": xax.HashableArray(xpos_sequence),
+                    "xquat": xax.HashableArray(xquat_sequence),
+                    "rel_xpos": xax.HashableArray(rel_xpos_sequence),
+                }
+            ),
             ctrl_dt=self.config.ctrl_dt,
         )
 
