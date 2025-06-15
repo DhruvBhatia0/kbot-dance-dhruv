@@ -475,17 +475,27 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         return [
             # Corresponds to "clock" in mimic tasks
             FrameTimestepObservation(motion_reference=self.reference_motion),
-            # Corresponds to qpos
+            # Joint state
             ksim.JointPositionObservation(noise=math.radians(3)),
-            # Corresponds to qvel
             ksim.JointVelocityObservation(noise=math.radians(90)),
-            # Corresponds to root z-pos
+            # IMU orientation (raw quaternion from on-board IMU)
+            ksim.SensorObservation.create(
+                physics_model=physics_model,
+                sensor_name="imu_site_quat",
+                noise=0.0,
+            ),
+            # IMU angular velocity (gyroscope)
+            ksim.SensorObservation.create(
+                physics_model=physics_model,
+                sensor_name="imu_gyro",
+                noise=math.radians(1.0),
+            ),
+            # Root quantities that are useful for the critic only. They are kept here so that the
+            # critic (which can use privileged information) still receives them while the actor will
+            # simply ignore them.
             ksim.BasePositionObservation(),
-            # Corresponds to root quat
             ksim.BaseOrientationObservation(),
-            # Corresponds to root lin vel
             ksim.BaseLinearVelocityObservation(),
-            # Corresponds to root ang vel
             ksim.BaseAngularVelocityObservation(),
         ]
 
@@ -520,18 +530,25 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
     def get_model(self, key: PRNGKeyArray) -> Model:
         num_joints = len(ZEROS)
 
-        # Calculate observation size
-        # root_z (1) + root_quat (4) + joint_pos (N) + root_lin_vel (3) + root_ang_vel (3) + joint_vel (N)
-        # + ref_qpos (N+7) + ref_qvel (N+6)
-        num_obs = 1 + 4 + num_joints + 3 + 3 + num_joints
-        num_ref_obs = (num_joints + 7) + (num_joints + 6)
-        num_inputs = num_obs + num_ref_obs
+        # ---------------- Actor inputs ----------------
+        # joint positions, joint velocities
+        num_actor_inputs = (
+            num_joints * 2
+            + 4  # IMU quaternion
+            + (3 if self.config.use_gyro else 0)  # IMU gyro (optional)
+            + (num_joints + 7)  # reference qpos (root + joints)
+            + (num_joints + 6)  # reference qvel (root (6 DoF) + joints)
+        )
+
+        # ---------------- Critic inputs ----------------
+        # The critic gets everything the actor gets PLUS the privileged root-state information.
+        num_critic_inputs = num_actor_inputs + 13  # base pos (3) + base ori (4) + lin vel (3) + ang vel (3)
 
         return Model(
             key,
-            num_actor_inputs=num_inputs,
+            num_actor_inputs=num_actor_inputs,
             num_actor_outputs=len(ZEROS),
-            num_critic_inputs=num_inputs,  # Critic is not privileged
+            num_critic_inputs=num_critic_inputs,
             min_std=0.01,
             max_std=1.0,
             var_scale=self.config.var_scale,
@@ -540,44 +557,6 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             depth=self.config.depth,
         )
 
-    def _get_obs_vec(
-        self,
-        observations: xax.FrozenDict[str, Array],
-    ) -> Array:
-        # ---- Base Observations ----
-        # from KBotV2FlatFoot._get_observation_specification
-        # ObservationType.FreeJointPosNoXY -> root_z, root_quat
-        # ObservationType.JointPos -> joint_pos_n
-        # ObservationType.FreeJointVel -> base_lin_vel_3, base_ang_vel_3
-        # ObservationType.JointVel -> joint_vel_n
-        root_z_1 = observations["base_position_observation"][..., 2:3]
-        root_quat_4 = observations["base_orientation_observation"]
-        joint_pos_n = observations["joint_position_observation"]
-        base_lin_vel_3 = observations["base_linear_velocity_observation"]
-        base_ang_vel_3 = observations["base_angular_velocity_observation"]
-        joint_vel_n = observations["joint_velocity_observation"]
-
-        # ---- Reference Motion Observations ----
-        timestep_1 = observations["frame_timestep_observation"]
-        ref_qpos = self.reference_motion.get_qpos_at_time(timestep_1).squeeze(0)
-        step = jnp.round(timestep_1 / self.reference_motion.ctrl_dt).astype(int)
-        max_qvel_step = self.reference_motion.qvel.array.shape[0] - 1
-        safe_step = jnp.clip(step, 0, max_qvel_step)
-        ref_qvel = self.reference_motion.get_qvel_at_step(safe_step).squeeze(0)
-
-        obs = [
-            root_z_1,
-            root_quat_4,
-            joint_pos_n,
-            base_lin_vel_3,
-            base_ang_vel_3,
-            joint_vel_n,
-            ref_qpos,
-            ref_qvel,
-        ]
-
-        return jnp.concatenate(obs, axis=-1)
-
     def run_actor(
         self,
         model: Actor,
@@ -585,10 +564,28 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         commands: xax.FrozenDict[str, Array],
         carry: Array,
     ) -> tuple[distrax.Distribution, Array]:
-        obs_n = self._get_obs_vec(observations)
-        action, carry = model.forward(obs_n, carry)
+        """Build the *non-privileged* observation vector for the actor and run the policy."""
+        joint_pos_n = observations["joint_position_observation"]
+        joint_vel_n = observations["joint_velocity_observation"]
+        imu_quat_4 = observations["sensor_observation_imu_site_quat"]
+        obs_parts = [joint_pos_n, joint_vel_n, imu_quat_4]
 
-        return action, carry
+        if self.config.use_gyro:
+            imu_gyro_3 = observations["sensor_observation_imu_gyro"]
+            obs_parts.append(imu_gyro_3)
+
+        # Reference motion (allowed for actor)
+        timestep_1 = observations["frame_timestep_observation"]
+        ref_qpos = self.reference_motion.get_qpos_at_time(timestep_1).squeeze(0)
+        step = jnp.round(timestep_1 / self.reference_motion.ctrl_dt).astype(int)
+        max_qvel_step = self.reference_motion.qvel.array.shape[0] - 1
+        safe_step = jnp.clip(step, 0, max_qvel_step)
+        ref_qvel = self.reference_motion.get_qvel_at_step(safe_step).squeeze(0)
+        obs_parts.extend([ref_qpos, ref_qvel])
+
+        obs_n = jnp.concatenate(obs_parts, axis=-1)
+        action_dist, next_carry = model.forward(obs_n, carry)
+        return action_dist, next_carry
 
     def run_critic(
         self,
@@ -597,8 +594,41 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         commands: xax.FrozenDict[str, Array],
         carry: Array,
     ) -> tuple[Array, Array]:
-        obs_n = self._get_obs_vec(observations)
-        return model.forward(obs_n, carry)
+        """Build the *privileged* observation vector for the critic."""
+        # Actor observations
+        joint_pos_n = observations["joint_position_observation"]
+        joint_vel_n = observations["joint_velocity_observation"]
+        imu_quat_4 = observations["sensor_observation_imu_site_quat"]
+        obs_parts = [joint_pos_n, joint_vel_n, imu_quat_4]
+        if self.config.use_gyro:
+            imu_gyro_3 = observations["sensor_observation_imu_gyro"]
+            obs_parts.append(imu_gyro_3)
+
+        timestep_1 = observations["frame_timestep_observation"]
+        ref_qpos = self.reference_motion.get_qpos_at_time(timestep_1).squeeze(0)
+        step = jnp.round(timestep_1 / self.reference_motion.ctrl_dt).astype(int)
+        max_qvel_step = self.reference_motion.qvel.array.shape[0] - 1
+        safe_step = jnp.clip(step, 0, max_qvel_step)
+        ref_qvel = self.reference_motion.get_qvel_at_step(safe_step).squeeze(0)
+        obs_parts.extend([ref_qpos, ref_qvel])
+
+        # Privileged root state information
+        base_position_3 = observations["base_position_observation"]
+        base_orientation_4 = observations["base_orientation_observation"]
+        base_lin_vel_3 = observations["base_linear_velocity_observation"]
+        base_ang_vel_3 = observations["base_angular_velocity_observation"]
+        obs_parts.extend(
+            [
+                base_position_3,
+                base_orientation_4,
+                base_lin_vel_3,
+                base_ang_vel_3,
+            ]
+        )
+
+        obs_n = jnp.concatenate(obs_parts, axis=-1)
+        value, next_carry = model.forward(obs_n, carry)
+        return value, next_carry
 
     def _ppo_scan_fn(
         self,
