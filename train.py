@@ -47,6 +47,20 @@ ZEROS: list[tuple[str, float, float]] = [
     ("dof_left_ankle_02", math.radians(-30.0), 1.0),
 ]
 
+SITE_XPOS_NAMES: list[str] = [
+    "added_pelvis_site",
+    "added_right_shoulder_site",
+    "added_left_shoulder_site",
+    "added_right_elbow_site",
+    "added_left_elbow_site",
+    "added_right_hand_site",
+    "added_left_hand_site",
+    "added_right_knee_site",
+    "added_left_knee_site",
+    "added_right_foot_site",
+    "added_left_foot_site",
+]
+
 
 @dataclass
 class HumanoidWalkingTaskConfig(ksim.PPOConfig):
@@ -726,6 +740,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         qvel_list = []
         xpos_list = []
         xquat_list = []
+        site_xpos_list = []
 
         for i in range(len(qpos_sequence) - 1):
             # Compute qvel using finite differences
@@ -740,10 +755,19 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
             # Extract xpos and xquat for all bodies
             xpos_list.append(mj_data.xpos.copy())
             xquat_list.append(mj_data.xquat.copy())
+            site_xpos_list.append(mj_data.site_xpos.copy())
 
         qvel_sequence = jnp.array(qvel_list)
         xpos_sequence = jnp.array(xpos_list)
         xquat_sequence = jnp.array(xquat_list)
+        site_xpos_sequence = jnp.array(site_xpos_list)
+        print(site_xpos_sequence.shape)
+        print(site_xpos_sequence[0])
+
+        # extract specific sites 
+        site_ids = [mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_SITE, name) for name in SITE_XPOS_NAMES]  
+        print(site_ids)
+        exit()
 
         self.reference_motion = ksim.MotionReferenceData(
             qpos=xax.HashableArray(qpos_sequence[:-1]),
@@ -779,8 +803,8 @@ if __name__ == "__main__":
     HumanoidWalkingTask.launch(
         HumanoidWalkingTaskConfig(
             # Training parameters.
-            num_envs=2048,
-            batch_size=128,
+            num_envs=2,
+            batch_size=1,
             num_passes=4,
             epochs_per_log_step=1,
             rollout_length_seconds=8.0,
