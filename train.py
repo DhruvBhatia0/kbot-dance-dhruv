@@ -253,11 +253,12 @@ class SiteRelativeXposReward(ksim.Reward):
 
     # Helper: slice (B, S, 3) → (B, N, 3) where N = len(site_ids)
     def _select(self, xyz: Array) -> Array:
-        return xyz[:, self.site_ids, :]
+        idx = self.site_ids.array
+        return xyz[:, idx, :]
 
     def get_reward(self, traj: ksim.Trajectory) -> Array:
         # 1) actor: full -> selected
-        act_sites_full = traj.cartesian_poses["site_xpos"]          # (B, S, 3)
+        act_sites_full = traj.site_xpos          # (B, S, 3)
         act_sites = self._select(act_sites_full)                    # (B, N, 3)
         # print("act_site_full shape: ", act_sites_full.shape)
         # print("act_sites shape:", act_sites.shape)
