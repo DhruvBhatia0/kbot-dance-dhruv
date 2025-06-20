@@ -242,6 +242,48 @@ class QvelReferenceMotionReward(ksim.Reward):
         return qvel_reward
 
 
+@attrs.define(frozen=True, kw_only=True)
+class SiteRelativeXposReward(ksim.Reward):
+    """Root-relative tracking of a chosen subset of sites (pelvis = first site)."""
+
+    reference_motion: ksim.MotionReferenceData
+    site_ids: Array                           
+    scale: float = 1.0
+    w_exp: float = 10.0                   # exponential sharpness
+
+    # Helper: slice (B, S, 3) → (B, N, 3) where N = len(site_ids)
+    def _select(self, xyz: Array) -> Array:
+        return xyz[:, self.site_ids, :]
+
+    def get_reward(self, traj: ksim.Trajectory) -> Array:
+        # 1) actor: full -> selected
+        act_sites_full = traj.cartesian_poses["site_xpos"]          # (B, S, 3)
+        act_sites = self._select(act_sites_full)                    # (B, N, 3)
+        # print("act_site_full shape: ", act_sites_full.shape)
+        # print("act_sites shape:", act_sites.shape)
+
+        # 2) reference: full -> selected (match current timestep)
+        step = jnp.clip(
+            jnp.round(traj.timestep / self.reference_motion.ctrl_dt).astype(int),
+            0,
+            self.reference_motion.cartesian_poses["site_xpos"].array.shape[0] - 1,
+        )
+        ref_sites_full = self.reference_motion.cartesian_poses["site_xpos"].array[step]  # (B, S, 3)
+        ref_sites = self._select(ref_sites_full)                                         # (B, N, 3)
+
+        # 3) subtract root (pelvis, assumed first in site_ids)
+        act_rel = act_sites - act_sites[:, :1, :]   # root-relative
+        ref_rel = ref_sites - ref_sites[:, :1, :]
+
+        # 4) drop the root
+        act_rel = act_rel[:, 1:, :]                 # (B, N-1, 3)
+        ref_rel = ref_rel[:, 1:, :]
+
+        # 5) MSE -> exponential reward
+        mse = jnp.square(act_rel - ref_rel).mean(axis=(-2, -1))     # (B,)
+        return jnp.exp(-self.w_exp * mse) * self.scale
+
+
 class Actor(eqx.Module):
     """Actor for the walking task."""
 
@@ -523,6 +565,7 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
                 reference_motion=self.reference_motion,
             ),
             QvelReferenceMotionReward(scale=1.0, reference_motion=self.reference_motion),
+            SiteRelativeXposReward(scale=1.0, reference_motion=self.reference_motion, site_ids= xax.HashableArray(self.site_ids))
         ]
 
     def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:
@@ -761,13 +804,12 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         xpos_sequence = jnp.array(xpos_list)
         xquat_sequence = jnp.array(xquat_list)
         site_xpos_sequence = jnp.array(site_xpos_list)
-        print(site_xpos_sequence.shape)
-        print(site_xpos_sequence[0])
 
         # extract specific sites 
-        site_ids = [mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_SITE, name) for name in SITE_XPOS_NAMES]  
-        print(site_ids)
-        exit()
+        self.site_ids = jnp.array([mujoco.mj_name2id(mj_model, mujoco.mjtObj.mjOBJ_SITE, name) for name in SITE_XPOS_NAMES])
+        n_sites = site_xpos_sequence.shape[1]
+        mask = jnp.zeros(n_sites, dtype=bool).at[self.site_ids].set(True)
+        selected_site_xpos = site_xpos_sequence[:, mask, :]
 
         self.reference_motion = ksim.MotionReferenceData(
             qpos=xax.HashableArray(qpos_sequence[:-1]),
@@ -776,13 +818,13 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
                 {
                     "xpos": xax.HashableArray(xpos_sequence),
                     "xquat": xax.HashableArray(xquat_sequence),
+                    "site_xpos": xax.HashableArray(selected_site_xpos)
                 }
             ),
             ctrl_dt=self.config.ctrl_dt,
         )
 
         if self.config.run_mode.lower() == "view_motion":
-            print(self.reference_motion.qpos.array[0])
             ksim.visualize_reference_motion(
                 model=self.get_mujoco_model(),
                 reference_qpos=np.asarray(self.reference_motion.qpos.array),
