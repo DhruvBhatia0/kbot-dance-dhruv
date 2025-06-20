@@ -49,8 +49,8 @@ ZEROS: list[tuple[str, float, float]] = [
 
 SITE_XPOS_NAMES: list[str] = [
     "added_pelvis_site",
-    "added_right_shoulder_site",
-    "added_left_shoulder_site",
+    # "added_right_shoulder_site",
+    # "added_left_shoulder_site",
     "added_right_elbow_site",
     "added_left_elbow_site",
     "added_right_hand_site",
@@ -249,7 +249,7 @@ class SiteRelativeXposReward(ksim.Reward):
     reference_motion: ksim.MotionReferenceData
     site_ids: Array                           
     scale: float = 1.0
-    w_exp: float = 10.0                   # exponential sharpness
+    w_exp: float = 100.0                   # exponential sharpness
 
     # Helper: slice (B, S, 3) → (B, N, 3) where N = len(site_ids)
     def _select(self, xyz: Array) -> Array:
@@ -260,8 +260,6 @@ class SiteRelativeXposReward(ksim.Reward):
         # 1) actor: full -> selected
         act_sites_full = traj.site_xpos          # (B, S, 3)
         act_sites = self._select(act_sites_full)                    # (B, N, 3)
-        # print("act_site_full shape: ", act_sites_full.shape)
-        # print("act_sites shape:", act_sites.shape)
 
         # 2) reference: full -> selected (match current timestep)
         step = jnp.clip(
@@ -562,11 +560,11 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
     def get_rewards(self, physics_model: ksim.PhysicsModel) -> list[ksim.Reward]:
         return [
             QposReferenceMotionReward(
-                scale=1.0,
+                scale=0.4,
                 reference_motion=self.reference_motion,
             ),
-            QvelReferenceMotionReward(scale=1.0, reference_motion=self.reference_motion),
-            SiteRelativeXposReward(scale=1.0, reference_motion=self.reference_motion, site_ids= xax.HashableArray(self.site_ids))
+            QvelReferenceMotionReward(scale=0.2, reference_motion=self.reference_motion),
+            SiteRelativeXposReward(scale=0.5, reference_motion=self.reference_motion, site_ids= xax.HashableArray(self.site_ids))
         ]
 
     def get_terminations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Termination]:
