@@ -523,7 +523,6 @@ class HumanoidWalkingTask(ksim.PPOTask[HumanoidWalkingTaskConfig]):
         return [
             ksim.RandomJointPositionReset.create(physics_model, {k: v for k, v, _ in ZEROS}, scale=math.radians(45)),
             ksim.RandomJointVelocityReset(),
-            ksim.RandomHeightReset(range=(0.0, 0.3)),
         ]
 
     def get_observations(self, physics_model: ksim.PhysicsModel) -> list[ksim.Observation]:
