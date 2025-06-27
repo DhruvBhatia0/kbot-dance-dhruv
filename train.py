@@ -54,7 +54,8 @@ class HumanoidWalkingTaskConfig(ksim.PPOConfig):
 
     # Task parameters.
     reference_motion_path: Path = xax.field(
-        value="dance_kawaii.mjanim",
+        # value="dance_kawaii.mjanim",
+        value="../kbot-walking/gaits/stand_to_walk.mjanim",
         help="The path to the reference motion to use for the task.",
     )
 
